@@ -1,0 +1,49 @@
+# Default configuration for MinerU performance testing
+
+# Benchmark settings
+benchmark:
+  # Device settings
+  devices: [0]  # List of device IDs to use
+  instances_per_device: 1  # Number of instances per device
+  
+  # Client settings
+  concurrency: 10  # Maximum concurrent requests
+  batch_size: 1  # Number of files per batch
+  timeout: 300  # Request timeout in seconds
+  
+  # Backend settings
+  backend: hybrid-auto-engine  # Options: pipeline, vlm-auto-engine, hybrid-auto-engine, vlm-http-client, hybrid-http-client
+  device_mode: npu  # Options: cpu, cuda, npu, mps
+  
+  # Test settings
+  input_dir: null  # Input directory path
+  output_dir: ./benchmark_output  # Output directory path
+  duration: 0  # Test duration in seconds (0 = process all files)
+  
+  # OmniDocBench mode
+  mode: throughput  # Options: throughput, omnidocbench
+  omnidocbench_path: null  # Path to OmniDocBench directory
+  omnidocbench_config: null  # Path to OmniDocBench config file
+  
+  # Monitoring settings
+  monitor_interval: 1.0  # Resource monitoring interval in seconds
+  enable_resource_monitor: true  # Enable/disable resource monitoring
+
+# Server settings (for advanced usage)
+server:
+  base_port: 8000  # Starting port number for instances
+  host: 127.0.0.1  # Server host address
+  max_workers: 4  # Maximum number of worker processes
+  
+# Monitoring settings
+monitor:
+  enable_cpu_monitor: true  # Monitor CPU usage
+  enable_memory_monitor: true  # Monitor memory usage
+  enable_gpu_monitor: true  # Monitor GPU/NPU usage
+  sample_interval: 1.0  # Sampling interval in seconds
+  
+# Report settings
+report:
+  format: json  # Report format: json, csv, markdown
+  include_raw_data: true  # Include raw data in report
+  generate_plots: true  # Generate visualization plots
