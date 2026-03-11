@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import statistics
+import tqdm
 
 from config import BenchmarkConfig
 
@@ -134,7 +135,7 @@ class BenchmarkClient:
         latency = time.time() - start_time
         return latency, success_count, error_count
 
-    async def _worker(self, name: int, session: aiohttp.ClientSession, queue: asyncio.Queue):
+    async def _worker(self, name: int, session: aiohttp.ClientSession, queue: asyncio.Queue, pbar: tqdm.tqdm):
         logger.info(f"[Worker {name}] Started.")
         while True:
             file_batch = await queue.get()
@@ -146,8 +147,8 @@ class BenchmarkClient:
                 
             latency, success_count, error_count = await self._send_request(name, session, file_batch)
             self.metrics.add_result(latency, success_count, error_count)
+            pbar.update(len(file_batch))
             queue.task_done()
-
 
     def _chunk_files(self, files: List[str], batch_size: int) -> List[List[str]]:
         return [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
@@ -185,15 +186,17 @@ class BenchmarkClient:
 
             # Start workers
             workers = []
-            for i in range(concurrency):
-                workers.append(asyncio.create_task(self._worker(i, session, queue)))
-                # queue termination signals
-                queue.put_nowait(None)
+            
+            with tqdm.tqdm(total=len(files), desc=f"Benchmarking ({concurrency} workers)") as pbar:
+                for i in range(concurrency):
+                    workers.append(asyncio.create_task(self._worker(i, session, queue, pbar)))
+                    # queue termination signals
+                    queue.put_nowait(None)
 
-            self.metrics.start()
-            await queue.join()
-            await asyncio.gather(*workers)
-            self.metrics.stop()
+                self.metrics.start()
+                await queue.join()
+                await asyncio.gather(*workers)
+                self.metrics.stop()
 
         summary = self.metrics.get_summary()
         logger.info(f"Benchmark run complete: {summary}")

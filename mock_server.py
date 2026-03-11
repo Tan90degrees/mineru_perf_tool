@@ -6,6 +6,12 @@ async def health_check(request):
     return web.json_response({"status": "ok"})
 
 async def file_parse(request):
+    # Consume the payload to prevent client socket errors
+    try:
+        await request.post()
+    except Exception:
+        pass
+    
     # Simulate processing time
     await asyncio.sleep(0.5)
     
