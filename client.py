@@ -79,19 +79,20 @@ class BenchmarkClient:
         self.current_endpoint_idx = (self.current_endpoint_idx + 1) % len(self.endpoints)
         return endpoint
 
-    async def _send_request(self, session: aiohttp.ClientSession, file_paths: List[str]) -> Tuple[float, int, int]:
+    async def _send_request(self, worker_name: int, session: aiohttp.ClientSession, file_paths: List[str]) -> Tuple[float, int, int]:
         endpoint = self._get_next_endpoint()
         url = f"{endpoint}/file_parse"
         
         start_time = time.time()
         success_count = 0
         error_count = 0
+        opened_files = []
         
+        logger.info(f"[Worker {worker_name}] Sending {len(file_paths)} files to {endpoint}...")
         try:
             # Need to use aiohttp FormData to match FastAPI UploadFile and Form
             data = aiohttp.FormData()
             
-            opened_files = []
             for file_path in file_paths:
                 f = open(file_path, 'rb')
                 opened_files.append(f)
@@ -114,32 +115,39 @@ class BenchmarkClient:
                 if response.status == 200:
                     _ = await response.json()
                     success_count = len(file_paths)
+                    logger.info(f"[Worker {worker_name}] Successfully processed {len(file_paths)} files in {time.time() - start_time:.2f}s")
                 else:
                     error_text = await response.text()
-                    logger.error(f"Error from {endpoint} for batch: {response.status} - {error_text}")
+                    logger.error(f"[Worker {worker_name}] Error from {endpoint}: {response.status} - {error_text}")
                     error_count = len(file_paths)
                     
-            for f in opened_files:
-                f.close()
-                
         except Exception as e:
-            logger.error(f"Batch request failed: {e}")
+            logger.error(f"[Worker {worker_name}] Batch request failed: {e}")
             error_count = len(file_paths)
+        finally:
+            for f in opened_files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
             
         latency = time.time() - start_time
         return latency, success_count, error_count
 
     async def _worker(self, name: int, session: aiohttp.ClientSession, queue: asyncio.Queue):
+        logger.info(f"[Worker {name}] Started.")
         while True:
             file_batch = await queue.get()
             if file_batch is None:
                 # Terminate worker
+                logger.info(f"[Worker {name}] Received termination signal. Exiting.")
                 queue.task_done()
                 break
                 
-            latency, success_count, error_count = await self._send_request(session, file_batch)
+            latency, success_count, error_count = await self._send_request(name, session, file_batch)
             self.metrics.add_result(latency, success_count, error_count)
             queue.task_done()
+
 
     def _chunk_files(self, files: List[str], batch_size: int) -> List[List[str]]:
         return [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
@@ -166,7 +174,7 @@ class BenchmarkClient:
             if self.config.warmup_requests > 0:
                 logger.info(f"Starting warmup with {self.config.warmup_requests} requests...")
                 warmup_files = files[:self.config.warmup_requests]
-                await asyncio.gather(*(self._send_request(session, [f]) for f in warmup_files))
+                await asyncio.gather(*(self._send_request("warmup", session, [f]) for f in warmup_files))
                 logger.info("Warmup complete.")
 
             queue = asyncio.Queue()

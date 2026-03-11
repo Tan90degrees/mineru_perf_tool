@@ -41,7 +41,7 @@ class ServerManager:
                 
                 env = os.environ.copy()
                 env["ASCEND_RT_VISIBLE_DEVICES"] = str(card_id)
-                env["MINERU_DEVICE_MODE"] = f"npu:{card_id}" # Fallback for MinerU's config_reader
+                # env["MINERU_DEVICE_MODE"] = f"npu:{card_id}" # Fallback for MinerU's config_reader
                 # Ensure each instance can handle at least the number of concurrency/clients it will be assigned
                 env["MINERU_API_MAX_CONCURRENT_REQUESTS"] = str(concurrency) 
                 
