@@ -60,7 +60,6 @@ class BenchmarkClient:
     def __init__(self, config: BenchmarkConfig, endpoints: List[str]):
         self.config = config
         self.endpoints = endpoints
-        self.current_endpoint_idx = 0
         self.metrics = MetricsCollector()
         self.files_to_process = self._scan_directory(self.config.data_dir)
 
@@ -74,14 +73,8 @@ class BenchmarkClient:
                     files.append(str(file_path))
         return files
 
-    def _get_next_endpoint(self) -> str:
-        # Load balancing across endpoints via round-robin
-        endpoint = self.endpoints[self.current_endpoint_idx]
-        self.current_endpoint_idx = (self.current_endpoint_idx + 1) % len(self.endpoints)
-        return endpoint
 
-    async def _send_request(self, worker_name: int, session: aiohttp.ClientSession, file_paths: List[str]) -> Tuple[float, int, int]:
-        endpoint = self._get_next_endpoint()
+    async def _send_request(self, worker_name: str, endpoint: str, session: aiohttp.ClientSession, file_paths: List[str]) -> Tuple[float, int, int]:
         url = f"{endpoint}/file_parse"
         
         start_time = time.time()
@@ -91,39 +84,32 @@ class BenchmarkClient:
         
         logger.info(f"[Worker {worker_name}] Sending {len(file_paths)} files to {endpoint}...")
         try:
-            # Need to use aiohttp FormData to match FastAPI UploadFile and Form
             data = aiohttp.FormData()
             
             for file_path in file_paths:
                 f = open(file_path, 'rb')
                 opened_files.append(f)
-                data.add_field('files',
-                               f,
-                               filename=os.path.basename(file_path))
-                               
-                # Form data uses lists for lang_list in fast_api
+                data.add_field('files', f, filename=os.path.basename(file_path))
                 data.add_field('lang_list', self.config.lang)
                 
             data.add_field('output_dir', self.config.output_dir)
             data.add_field('backend', self.config.backend)
             data.add_field('parse_method', self.config.parse_method)
-            # Ensure correct types
             data.add_field('formula_enable', 'True')
             data.add_field('table_enable', 'True')
             
             async with session.post(url, data=data) as response:
-                # status 200 means success
                 if response.status == 200:
                     _ = await response.json()
                     success_count = len(file_paths)
-                    logger.info(f"[Worker {worker_name}] Successfully processed {len(file_paths)} files in {time.time() - start_time:.2f}s")
+                    logger.info(f"[Worker {worker_name}] Done: {len(file_paths)} files in {time.time() - start_time:.2f}s")
                 else:
                     error_text = await response.text()
-                    logger.error(f"[Worker {worker_name}] Error from {endpoint}: {response.status} - {error_text}")
+                    logger.error(f"[Worker {worker_name}] Error {response.status}: {error_text}")
                     error_count = len(file_paths)
                     
         except Exception as e:
-            logger.error(f"[Worker {worker_name}] Batch request failed: {e}")
+            logger.error(f"[Worker {worker_name}] Failed: {e}")
             error_count = len(file_paths)
         finally:
             for f in opened_files:
@@ -135,26 +121,36 @@ class BenchmarkClient:
         latency = time.time() - start_time
         return latency, success_count, error_count
 
-    async def _worker(self, name: int, session: aiohttp.ClientSession, queue: asyncio.Queue, pbar: tqdm.tqdm):
-        logger.info(f"[Worker {name}] Started.")
+    async def _dedicated_worker(self, name: str, endpoint: str, session: aiohttp.ClientSession,
+                                queue: asyncio.Queue, pbar: tqdm.tqdm):
+        """
+        Dedicated worker bound to a single endpoint.
+        Continuously pulls batches from the shared queue and sends them to its
+        assigned endpoint one at a time. Since each MinerU instance is internally
+        serial, this fully saturates the instance without leaving it idle.
+        """
+        logger.info(f"[Worker {name}] Started, bound to {endpoint}.")
         while True:
             file_batch = await queue.get()
             if file_batch is None:
-                # Terminate worker
-                logger.info(f"[Worker {name}] Received termination signal. Exiting.")
+                logger.info(f"[Worker {name}] No more tasks. Exiting.")
                 queue.task_done()
                 break
                 
-            latency, success_count, error_count = await self._send_request(name, session, file_batch)
+            latency, success_count, error_count = await self._send_request(name, endpoint, session, file_batch)
             self.metrics.add_result(latency, success_count, error_count)
-            pbar.update(len(file_batch))
+            pbar.update(success_count + error_count)
             queue.task_done()
 
     def _chunk_files(self, files: List[str], batch_size: int) -> List[List[str]]:
         return [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
 
-    async def run_benchmark(self, concurrency: int, batch_size: int) -> Dict[str, Any]:
-        """Runs the load test and returns the metrics."""
+    async def run_benchmark(self, batch_size: int) -> Dict[str, Any]:
+        """
+        Run the load test using a dedicated-worker-per-instance strategy.
+        One worker is bound to each endpoint, pulling tasks from a shared queue.
+        This fully saturates every instance regardless of each endpoint's serial nature.
+        """
         self.metrics = MetricsCollector()
         
         files = self.files_to_process
@@ -165,33 +161,42 @@ class BenchmarkClient:
             logger.warning("No files to process!")
             return self.metrics.get_summary()
 
-        logger.info(f"Starting test with {len(files)} files, concurrency={concurrency}, batch_size={batch_size}.")
+        num_instances = len(self.endpoints)
+        logger.info(f"Starting test with {len(files)} files, {num_instances} instances, batch_size={batch_size}.")
         
-        # We need a large timeout as MinerU inference can take a while per file (especially VLM)
         timeout = aiohttp.ClientTimeout(total=3600)
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Warm up
+            # Warm up — send one request to each instance
             if self.config.warmup_requests > 0:
-                logger.info(f"Starting warmup with {self.config.warmup_requests} requests...")
-                warmup_files = files[:self.config.warmup_requests]
-                await asyncio.gather(*(self._send_request("warmup", session, [f]) for f in warmup_files))
+                logger.info(f"Starting warmup ({self.config.warmup_requests} requests per instance)...")
+                warmup_tasks = []
+                for ep_idx, endpoint in enumerate(self.endpoints):
+                    warmup_batch = files[:self.config.warmup_requests]
+                    warmup_tasks.append(
+                        self._send_request(f"warmup-{ep_idx}", endpoint, session, warmup_batch)
+                    )
+                await asyncio.gather(*warmup_tasks)
                 logger.info("Warmup complete.")
 
+            # Shared work queue — all batches go in, each worker competes for them
             queue = asyncio.Queue()
-            
             batches = self._chunk_files(files, batch_size)
             for batch in batches:
                 queue.put_nowait(batch)
 
-            # Start workers
-            workers = []
-            
-            with tqdm.tqdm(total=len(files), desc=f"Benchmarking ({concurrency} workers)") as pbar:
-                for i in range(concurrency):
-                    workers.append(asyncio.create_task(self._worker(i, session, queue, pbar)))
-                    # queue termination signals
-                    queue.put_nowait(None)
+            # One termination sentinel per worker
+            for _ in range(num_instances):
+                queue.put_nowait(None)
+
+            # Start one dedicated worker per endpoint
+            with tqdm.tqdm(total=len(files), desc=f"Benchmarking ({num_instances} instances)") as pbar:
+                workers = [
+                    asyncio.create_task(
+                        self._dedicated_worker(f"inst-{i}", ep, session, queue, pbar)
+                    )
+                    for i, ep in enumerate(self.endpoints)
+                ]
 
                 self.metrics.start()
                 await queue.join()
@@ -201,3 +206,4 @@ class BenchmarkClient:
         summary = self.metrics.get_summary()
         logger.info(f"Benchmark run complete: {summary}")
         return summary
+

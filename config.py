@@ -7,8 +7,7 @@ class BenchmarkConfig(BaseModel):
     
     # Grid search parameters
     instances_per_card: List[int] = [1]
-    concurrency_list: List[int] = [1, 2, 4]
-    batch_size_list: List[int] = [1] # Batch size is implemented as concurrent requests as MinerU API processes files 1-by-1
+    batch_size_list: List[int] = [1]
     
     # MinerU processing parameters
     backend: str = "pipeline" # pipeline, vlm-auto-engine, hybrid-auto-engine

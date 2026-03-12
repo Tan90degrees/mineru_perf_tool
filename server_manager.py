@@ -25,7 +25,7 @@ class ServerManager:
             port += 1
         return port
 
-    def start_servers(self, num_cards: int, instances_per_card: int, concurrency: int):
+    def start_servers(self, num_cards: int, instances_per_card: int):
         """Starts MinerU API server instances."""
         logger.info(f"Starting {num_cards * instances_per_card} servers over {num_cards} cards.")
         self.processes.clear()
@@ -41,9 +41,6 @@ class ServerManager:
                 
                 env = os.environ.copy()
                 env["ASCEND_RT_VISIBLE_DEVICES"] = str(card_id)
-                # env["MINERU_DEVICE_MODE"] = f"npu:{card_id}" # Fallback for MinerU's config_reader
-                # Ensure each instance can handle at least the number of concurrency/clients it will be assigned
-                env["MINERU_API_MAX_CONCURRENT_REQUESTS"] = str(concurrency) 
                 
                 import sys
                 if self.config.mock_mode:
@@ -59,7 +56,7 @@ class ServerManager:
                         "--port", str(port)
                     ]
                 
-                logger.info(f"Starting server on card {card_id}, port {port} with concurrency {concurrency}")
+                logger.info(f"Starting server on card {card_id}, port {port}")
                 
                 # Start the subprocess
                 try:

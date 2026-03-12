@@ -17,7 +17,6 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing PDF or Image files")
     parser.add_argument("--cards", type=int, nargs="+", default=[0], help="List of NPU card IDs to use")
     parser.add_argument("--instances_per_card", type=int, nargs="+", default=[1], help="List of # instances per card to test")
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4], help="List of request concurrency levels to test")
     parser.add_argument("--batch_size", type=int, nargs="+", default=[1], help="List of request batch sizes to test")
     parser.add_argument("--backend", type=str, default="pipeline", choices=["pipeline", "vlm-auto-engine", "hybrid-auto-engine"], help="Backend to evaluate")
     parser.add_argument("--lang", type=str, default="ch", help="Language parameter for MinerU")
@@ -33,7 +32,6 @@ async def main():
     config = BenchmarkConfig(
         cards=args.cards,
         instances_per_card=args.instances_per_card,
-        concurrency_list=args.concurrency,
         batch_size_list=args.batch_size,
         backend=args.backend,
         lang=args.lang,
@@ -46,7 +44,6 @@ async def main():
     logger.info(f"Starting grid search benchmark for MinerU ({config.backend})")
     logger.info(f"Cards: {config.cards}")
     logger.info(f"Instances per card options: {config.instances_per_card}")
-    logger.info(f"Concurrency options: {config.concurrency_list}")
     logger.info(f"Batch size options: {config.batch_size_list}")
 
     server_manager = ServerManager(config)
@@ -57,43 +54,42 @@ async def main():
         num_cards = len(config.cards)
         
         for num_instances in config.instances_per_card:
-            for concurrency in config.concurrency_list:
-                for batch_size in config.batch_size_list:
-                    logger.info(f"\n{'='*50}")
-                    logger.info(f"Running Test - Instances/Card: {num_instances}, Total Concurrency: {concurrency}, Batch Size: {batch_size}")
-                    logger.info(f"{'='*50}")
+            for batch_size in config.batch_size_list:
+                total_instances = num_cards * num_instances
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Running Test - Instances/Card: {num_instances}, Total Instances: {total_instances}, Batch Size: {batch_size}")
+                logger.info(f"{'='*50}")
 
-                    # Start servers
-                    try:
-                        server_manager.start_servers(num_cards, num_instances, concurrency)
-                    except Exception as e:
-                        logger.error(f"Skipping configuration due to server startup error: {e}")
-                        continue
+                # Start servers
+                try:
+                    server_manager.start_servers(num_cards, num_instances)
+                except Exception as e:
+                    logger.error(f"Skipping configuration due to server startup error: {e}")
+                    continue
+                
+                # Initialize client
+                client = BenchmarkClient(config, server_manager.active_endpoints)
+                
+                # Run benchmark
+                try:
+                    metrics = await client.run_benchmark(batch_size)
                     
-                    # Initialize client
-                    client = BenchmarkClient(config, server_manager.active_endpoints)
+                    # Store result
+                    row = {
+                        "cards": num_cards,
+                        "instances_per_card": num_instances,
+                        "total_instances": total_instances,
+                        "batch_size": batch_size,
+                        "backend": config.backend,
+                        **metrics
+                    }
+                    results.append(row)
                     
-                    # Run benchmark
-                    try:
-                        metrics = await client.run_benchmark(concurrency, batch_size)
-                        
-                        # Store result
-                        row = {
-                            "cards": num_cards,
-                            "instances_per_card": num_instances,
-                            "total_instances": num_cards * num_instances,
-                            "concurrency": concurrency,
-                            "batch_size": batch_size,
-                            "backend": config.backend,
-                            **metrics
-                        }
-                        results.append(row)
-                        
-                    except Exception as e:
-                        logger.error(f"Benchmark run failed: {e}")
-                    
-                    # Turn off servers for next config
-                    server_manager.stop_all()
+                except Exception as e:
+                    logger.error(f"Benchmark run failed: {e}")
+                
+                # Turn off servers for next config
+                server_manager.stop_all()
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user, shutting down servers...")
