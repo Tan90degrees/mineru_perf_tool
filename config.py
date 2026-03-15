@@ -25,4 +25,5 @@ class BenchmarkConfig(BaseModel):
     # Test control
     warmup_requests: int = 2
     max_requests_per_test: Optional[int] = None # If None, process all files in data_dir
-    mock_mode: bool = False # Use mock server for testing validation
+    mock_mode: bool = False # Use mock HTTP server for testing validation
+    ipc_mode: bool = False  # Use direct IPC workers (no HTTP, no network overhead)

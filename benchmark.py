@@ -6,14 +6,16 @@ import logging
 
 from config import BenchmarkConfig
 from server_manager import ServerManager
+from ipc_server_manager import IPCServerManager
 from client import BenchmarkClient
+from ipc_client import LocalBenchmarkClient
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # CSV column order — fixed so all runs share the same schema
 CSV_FIELDNAMES = [
-    "cards", "instances_per_card", "total_instances",
+    "mode", "cards", "instances_per_card", "total_instances",
     "batch_size", "backend",
     "total_files", "success_rate", "throughput_fps",
     "avg_latency_s", "p90_latency_s", "p99_latency_s", "total_time_s",
@@ -31,22 +33,45 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup requests")
     parser.add_argument("--max_requests", type=int, default=None, help="Max requests per test (for quick testing)")
     parser.add_argument("--output_csv", type=str, default="benchmark_results.csv", help="Output CSV file (results are appended across runs)")
-    parser.add_argument("--mock", action="store_true", help="Use mock MinerU server for tool testing validation")
+    # Mode selection (mutually exclusive)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--mock", action="store_true", help="Use mock HTTP server (for tool validation, no MinerU needed)")
+    mode_group.add_argument("--ipc", action="store_true", help="Use direct IPC workers (no HTTP, max throughput, requires MinerU)")
     return parser.parse_args()
 
 
 def open_csv_writer(output_csv: str):
-    """
-    Open the CSV in append mode.
-    Write the header only when creating a brand-new file.
-    Returns (file_handle, csv.DictWriter).
-    """
+    """Open CSV in append mode; write header only when creating a new file."""
     file_exists = os.path.isfile(output_csv) and os.path.getsize(output_csv) > 0
     f = open(output_csv, 'a', newline='', encoding='utf-8')
     writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
     if not file_exists:
         writer.writeheader()
     return f, writer
+
+
+async def run_http_mode(config: BenchmarkConfig, num_cards: int,
+                        num_instances: int, batch_size: int,
+                        server_manager: ServerManager) -> dict:
+    """One HTTP-mode evaluation run (mock or real fast_api)."""
+    server_manager.start_servers(num_cards, num_instances)
+    client = BenchmarkClient(config, server_manager.active_endpoints)
+    try:
+        return await client.run_benchmark(batch_size)
+    finally:
+        server_manager.stop_all()
+
+
+async def run_ipc_mode(config: BenchmarkConfig, num_cards: int,
+                       num_instances: int, batch_size: int,
+                       ipc_manager: IPCServerManager) -> dict:
+    """One IPC-mode evaluation run (direct do_parse, no HTTP)."""
+    ipc_manager.start_workers(num_cards, num_instances)
+    client = LocalBenchmarkClient(config, ipc_manager.ipc_endpoints)
+    try:
+        return await client.run_benchmark(batch_size)
+    finally:
+        ipc_manager.stop_all()
 
 
 async def main():
@@ -61,16 +86,20 @@ async def main():
         data_dir=args.data_dir,
         warmup_requests=args.warmup,
         max_requests_per_test=args.max_requests,
-        mock_mode=args.mock
+        mock_mode=args.mock,
+        ipc_mode=args.ipc,
     )
 
-    logger.info(f"Starting grid search benchmark for MinerU ({config.backend})")
+    mode_label = "ipc" if args.ipc else ("mock" if args.mock else "http")
+    logger.info(f"Starting grid search benchmark for MinerU ({config.backend}) — mode: {mode_label}")
     logger.info(f"Cards: {config.cards}")
     logger.info(f"Instances per card options: {config.instances_per_card}")
     logger.info(f"Batch size options: {config.batch_size_list}")
     logger.info(f"Results will be appended to: {args.output_csv}")
 
-    server_manager = ServerManager(config)
+    server_manager = ServerManager(config) if not args.ipc else None
+    ipc_manager = IPCServerManager(config) if args.ipc else None
+
     csv_file, csv_writer = open_csv_writer(args.output_csv)
 
     try:
@@ -80,24 +109,17 @@ async def main():
             for batch_size in config.batch_size_list:
                 total_instances = num_cards * num_instances
                 logger.info(f"\n{'='*50}")
-                logger.info(f"Running Test - Instances/Card: {num_instances}, Total Instances: {total_instances}, Batch Size: {batch_size}")
+                logger.info(f"Running Test — Instances/Card: {num_instances}, Total: {total_instances}, Batch: {batch_size}, Mode: {mode_label}")
                 logger.info(f"{'='*50}")
 
-                # Start servers
                 try:
-                    server_manager.start_servers(num_cards, num_instances)
-                except Exception as e:
-                    logger.error(f"Skipping configuration due to server startup error: {e}")
-                    continue
-
-                # Initialize client
-                client = BenchmarkClient(config, server_manager.active_endpoints)
-
-                # Run benchmark
-                try:
-                    metrics = await client.run_benchmark(batch_size)
+                    if args.ipc:
+                        metrics = await run_ipc_mode(config, num_cards, num_instances, batch_size, ipc_manager)
+                    else:
+                        metrics = await run_http_mode(config, num_cards, num_instances, batch_size, server_manager)
 
                     row = {
+                        "mode": mode_label,
                         "cards": num_cards,
                         "instances_per_card": num_instances,
                         "total_instances": total_instances,
@@ -105,7 +127,6 @@ async def main():
                         "backend": config.backend,
                         **metrics
                     }
-                    # Write and flush immediately — Ctrl+C won't lose this row
                     csv_writer.writerow(row)
                     csv_file.flush()
                     logger.info(f"Result saved → {args.output_csv}")
@@ -113,18 +134,17 @@ async def main():
                 except Exception as e:
                     logger.error(f"Benchmark run failed: {e}")
 
-                # Stop servers before next config
-                server_manager.stop_all()
-
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
     finally:
-        # Always kill servers and close CSV, even on Ctrl+C or crash
-        server_manager.stop_all()
+        if server_manager:
+            server_manager.stop_all()
+        if ipc_manager:
+            ipc_manager.stop_all()
         csv_file.close()
-        logger.info("Benchmark finished. All servers stopped.")
+        logger.info("Benchmark finished. All workers stopped.")
 
 
 if __name__ == "__main__":
