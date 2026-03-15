@@ -1,42 +1,46 @@
 """
 ipc_server_manager.py — Manages a pool of IPC worker processes.
 
-Starts a multiprocessing.managers.BaseManager to host the shared queues,
-then spawns ipc_worker.py subprocesses that connect to it.
+Starts a MinerUQueueManager (from ipc_queue_manager.py) to host the
+shared queues, then spawns ipc_worker.py subprocesses that connect to it.
 
-The client-facing interface is:
-  - manager.ipc_endpoints: list of (worker_id, req_queue, res_queue) tuples
-  - ipc_stop_all(): kill all workers + shutdown manager
+Cross-platform notes:
+  - Uses module-level picklable callables (via ipc_queue_manager) — no lambdas.
+  - Works on both Windows (spawn) and Linux (fork/spawn).
+  - Subprocess stdout/stderr are piped to avoid blocking on Windows.
 """
 import os
 import sys
 import time
+import socket
 import subprocess
 import logging
-import multiprocessing
-import multiprocessing.managers
 from typing import List, Tuple
 
 from config import BenchmarkConfig
+from ipc_queue_manager import MinerUQueueManager, connect_manager
 
 logger = logging.getLogger(__name__)
 
-AUTHKEY = b"mineru-ipc-bench"
+AUTHKEY = b"mineru-ipc-bench-2025"
 
 
-class _IPCQueueServer(multiprocessing.managers.BaseManager):
-    pass
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 class IPCServerManager:
     """
-    Manages MinerU worker processes that communicate via multiprocessing queues
-    instead of HTTP.  One (req_queue, res_queue) pair per worker instance.
+    Manages MinerU worker processes that communicate via multiprocessing
+    queues instead of HTTP, avoiding all network overhead.
     """
 
     def __init__(self, config: BenchmarkConfig):
         self.config = config
-        self._manager: _IPCQueueServer = None
+        self._manager: MinerUQueueManager = None
         self._manager_port: int = None
         self._processes: List[subprocess.Popen] = []
         # List of (worker_id, req_queue_proxy, res_queue_proxy)
@@ -47,7 +51,7 @@ class IPCServerManager:
     # ------------------------------------------------------------------
 
     def start_workers(self, num_cards: int, instances_per_card: int):
-        """Starts the queue manager and all worker subprocesses."""
+        """Start the queue manager server, then spawn all worker subprocesses."""
         self._start_manager()
 
         cards = self.config.cards[:num_cards]
@@ -57,20 +61,26 @@ class IPCServerManager:
                 self._launch_worker(worker_id, card_id)
                 worker_id += 1
 
-        logger.info(f"Waiting for {worker_id} IPC workers to be ready...")
-        self._wait_for_workers(worker_id)
+        total = worker_id
+        logger.info(f"Waiting for {total} IPC workers to connect...")
+        # Give workers time to start up and connect
+        self._poll_workers_alive(total, timeout=60)
+        # Extra grace period for model loading (real mode)
+        if not self.config.mock_mode:
+            logger.info("Waiting for MinerU models to load (this may take a while)...")
+            time.sleep(5)
         logger.info("All IPC workers ready.")
 
     def stop_all(self):
-        """Terminate all workers and shut down the manager."""
-        # Send poison pills
+        """Send shutdown signals, wait for workers, stop manager."""
+        # Send poison pills to all workers
         for wid, req_q, _ in self.ipc_endpoints:
             try:
                 req_q.put(None)
             except Exception:
                 pass
 
-        # Wait / kill subprocesses
+        # Wait / force kill
         for p in self._processes:
             if p.poll() is None:
                 try:
@@ -80,7 +90,7 @@ class IPCServerManager:
         self._processes.clear()
         self.ipc_endpoints.clear()
 
-        # Shut down manager
+        # Stop the manager
         if self._manager is not None:
             try:
                 self._manager.shutdown()
@@ -91,42 +101,19 @@ class IPCServerManager:
         logger.info("All IPC workers stopped.")
 
     # ------------------------------------------------------------------
-    # Internals
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _start_manager(self):
-        """Start the BaseManager that hosts all queues."""
-        # Pick a free port
-        import socket
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        self._manager_port = s.getsockname()[1]
-        s.close()
-
-        # Register queue factories for each potential worker slot
-        # We pre-register up to 32 slots; unused ones are harmless
-        max_slots = 32
-        queues: dict = {}
-        for i in range(max_slots):
-            req_q: multiprocessing.Queue = multiprocessing.Queue()
-            res_q: multiprocessing.Queue = multiprocessing.Queue()
-            queues[i] = (req_q, res_q)
-
-        class _Server(_IPCQueueServer):
-            pass
-
-        for i in range(max_slots):
-            rq, rsq = queues[i]
-            _Server.register(f"get_req_queue_{i}", callable=lambda q=rq: q)
-            _Server.register(f"get_res_queue_{i}", callable=lambda q=rsq: q)
-
-        self._manager = _Server(address=("127.0.0.1", self._manager_port), authkey=AUTHKEY)
+        self._manager_port = _find_free_port()
+        self._manager = MinerUQueueManager(
+            address=("127.0.0.1", self._manager_port),
+            authkey=AUTHKEY,
+        )
         self._manager.start()
-        self._queues = queues  # keep strong references
         logger.info(f"IPC Queue Manager started on port {self._manager_port}")
 
     def _launch_worker(self, worker_id: int, card_id: int):
-        """Spawn one ipc_worker.py subprocess."""
         env = os.environ.copy()
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(card_id)
 
@@ -142,6 +129,8 @@ class IPCServerManager:
             "--lang", self.config.lang,
             "--output_dir", self.config.output_dir,
         ]
+        if self.config.mock_mode:
+            cmd.append("--mock")
 
         logger.info(f"Launching IPC worker {worker_id} on card {card_id}")
         p = subprocess.Popen(
@@ -153,33 +142,24 @@ class IPCServerManager:
         )
         self._processes.append(p)
 
-        # Build client-side proxy handles using our manager
-        client = _IPCQueueServer(address=("127.0.0.1", self._manager_port), authkey=AUTHKEY)
-        client.register(f"get_req_queue_{worker_id}")
-        client.register(f"get_res_queue_{worker_id}")
-        client.connect()
-
-        req_proxy = getattr(client, f"get_req_queue_{worker_id}")()
-        res_proxy = getattr(client, f"get_res_queue_{worker_id}")()
+        # Connect from the main process to get proxy queue handles
+        client_mgr = connect_manager("127.0.0.1", self._manager_port, AUTHKEY)
+        req_proxy = client_mgr.get_req_queue(worker_id)
+        res_proxy = client_mgr.get_res_queue(worker_id)
         self.ipc_endpoints.append((worker_id, req_proxy, res_proxy))
 
-    def _wait_for_workers(self, num_workers: int, timeout: int = 120):
-        """
-        Poll worker subprocesses; they're considered 'ready' once they've
-        connected to the manager (their process stays alive for > 2s).
-        """
+    def _poll_workers_alive(self, num_workers: int, timeout: int):
+        """Verify all worker processes are still alive (haven't crashed at startup)."""
         deadline = time.time() + timeout
-        alive = [False] * num_workers
         while time.time() < deadline:
+            all_ok = True
             for i, p in enumerate(self._processes):
                 if p.poll() is not None:
-                    out, _ = p.communicate()
+                    out = p.stdout.read() if p.stdout else ""
                     raise RuntimeError(
-                        f"Worker {i} died at startup:\n{out}"
+                        f"IPC worker {i} exited early (code {p.returncode}):\n{out}"
                     )
-                alive[i] = True
-            if all(alive):
-                time.sleep(3)  # Give workers time to load models
+            if all_ok:
+                time.sleep(2)  # Workers are alive — give them time to connect+load
                 return
-            time.sleep(1)
-        raise TimeoutError("IPC workers did not start in time.")
+        raise TimeoutError("IPC workers did not start within the timeout.")

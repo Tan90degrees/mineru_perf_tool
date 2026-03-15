@@ -13,7 +13,7 @@ from ipc_client import LocalBenchmarkClient
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# CSV column order — fixed so all runs share the same schema
+# CSV column order — fixed across all runs / modes
 CSV_FIELDNAMES = [
     "mode", "cards", "instances_per_card", "total_instances",
     "batch_size", "backend",
@@ -23,25 +23,45 @@ CSV_FIELDNAMES = [
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MinerU Throughput Evaluation Tool")
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing PDF or Image files")
-    parser.add_argument("--cards", type=int, nargs="+", default=[0], help="List of NPU card IDs to use")
-    parser.add_argument("--instances_per_card", type=int, nargs="+", default=[1], help="List of # instances per card to test")
-    parser.add_argument("--batch_size", type=int, nargs="+", default=[1], help="List of request batch sizes to test")
-    parser.add_argument("--backend", type=str, default="pipeline", choices=["pipeline", "vlm-auto-engine", "hybrid-auto-engine"], help="Backend to evaluate")
-    parser.add_argument("--lang", type=str, default="ch", help="Language parameter for MinerU")
-    parser.add_argument("--warmup", type=int, default=1, help="Number of warmup requests")
-    parser.add_argument("--max_requests", type=int, default=None, help="Max requests per test (for quick testing)")
-    parser.add_argument("--output_csv", type=str, default="benchmark_results.csv", help="Output CSV file (results are appended across runs)")
-    # Mode selection (mutually exclusive)
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--mock", action="store_true", help="Use mock HTTP server (for tool validation, no MinerU needed)")
-    mode_group.add_argument("--ipc", action="store_true", help="Use direct IPC workers (no HTTP, max throughput, requires MinerU)")
+    parser = argparse.ArgumentParser(
+        description="MinerU Throughput Evaluation Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  (default)    HTTP + real MinerU fast_api server
+  --mock       HTTP + mock server (no MinerU needed, for tool validation)
+  --ipc        Direct IPC + real MinerU do_parse (no HTTP, max throughput)
+  --ipc --mock Direct IPC + simulated processing (no MinerU needed, for validation)
+""",
+    )
+    parser.add_argument("--data_dir", type=str, required=True,
+                        help="Directory containing PDF or image files")
+    parser.add_argument("--cards", type=int, nargs="+", default=[0],
+                        help="NPU card IDs to use")
+    parser.add_argument("--instances_per_card", type=int, nargs="+", default=[1],
+                        help="Number of instances per card (grid search dimension)")
+    parser.add_argument("--batch_size", type=int, nargs="+", default=[1],
+                        help="Files per request batch (grid search dimension)")
+    parser.add_argument("--backend", type=str, default="pipeline",
+                        choices=["pipeline", "vlm-auto-engine", "hybrid-auto-engine"],
+                        help="MinerU backend")
+    parser.add_argument("--lang", type=str, default="ch",
+                        help="Language for MinerU OCR")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="Warmup requests sent before timing starts")
+    parser.add_argument("--max_requests", type=int, default=None,
+                        help="Cap total files per test (useful for quick runs)")
+    parser.add_argument("--output_csv", type=str, default="benchmark_results.csv",
+                        help="Results CSV (append mode — safe to reuse across runs)")
+    parser.add_argument("--mock", action="store_true",
+                        help="Use simulated processing instead of real MinerU")
+    parser.add_argument("--ipc", action="store_true",
+                        help="Use direct IPC workers instead of HTTP server")
     return parser.parse_args()
 
 
 def open_csv_writer(output_csv: str):
-    """Open CSV in append mode; write header only when creating a new file."""
+    """Open in append mode; header written only for new files."""
     file_exists = os.path.isfile(output_csv) and os.path.getsize(output_csv) > 0
     f = open(output_csv, 'a', newline='', encoding='utf-8')
     writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -50,10 +70,8 @@ def open_csv_writer(output_csv: str):
     return f, writer
 
 
-async def run_http_mode(config: BenchmarkConfig, num_cards: int,
-                        num_instances: int, batch_size: int,
-                        server_manager: ServerManager) -> dict:
-    """One HTTP-mode evaluation run (mock or real fast_api)."""
+async def run_http_benchmark(config, num_cards, num_instances, batch_size,
+                             server_manager: ServerManager) -> dict:
     server_manager.start_servers(num_cards, num_instances)
     client = BenchmarkClient(config, server_manager.active_endpoints)
     try:
@@ -62,10 +80,8 @@ async def run_http_mode(config: BenchmarkConfig, num_cards: int,
         server_manager.stop_all()
 
 
-async def run_ipc_mode(config: BenchmarkConfig, num_cards: int,
-                       num_instances: int, batch_size: int,
-                       ipc_manager: IPCServerManager) -> dict:
-    """One IPC-mode evaluation run (direct do_parse, no HTTP)."""
+async def run_ipc_benchmark(config, num_cards, num_instances, batch_size,
+                            ipc_manager: IPCServerManager) -> dict:
     ipc_manager.start_workers(num_cards, num_instances)
     client = LocalBenchmarkClient(config, ipc_manager.ipc_endpoints)
     try:
@@ -90,12 +106,18 @@ async def main():
         ipc_mode=args.ipc,
     )
 
-    mode_label = "ipc" if args.ipc else ("mock" if args.mock else "http")
-    logger.info(f"Starting grid search benchmark for MinerU ({config.backend}) — mode: {mode_label}")
-    logger.info(f"Cards: {config.cards}")
-    logger.info(f"Instances per card options: {config.instances_per_card}")
-    logger.info(f"Batch size options: {config.batch_size_list}")
-    logger.info(f"Results will be appended to: {args.output_csv}")
+    if args.ipc and args.mock:
+        mode_label = "ipc-mock"
+    elif args.ipc:
+        mode_label = "ipc"
+    elif args.mock:
+        mode_label = "http-mock"
+    else:
+        mode_label = "http"
+
+    logger.info(f"MinerU Benchmark — backend: {config.backend}, mode: {mode_label}")
+    logger.info(f"Cards: {config.cards} | Instances/card: {config.instances_per_card} | Batch sizes: {config.batch_size_list}")
+    logger.info(f"Appending results to: {args.output_csv}")
 
     server_manager = ServerManager(config) if not args.ipc else None
     ipc_manager = IPCServerManager(config) if args.ipc else None
@@ -104,19 +126,22 @@ async def main():
 
     try:
         num_cards = len(config.cards)
-
         for num_instances in config.instances_per_card:
             for batch_size in config.batch_size_list:
                 total_instances = num_cards * num_instances
                 logger.info(f"\n{'='*50}")
-                logger.info(f"Running Test — Instances/Card: {num_instances}, Total: {total_instances}, Batch: {batch_size}, Mode: {mode_label}")
+                logger.info(f"Test: {num_instances} inst/card × {num_cards} cards = {total_instances} inst | batch={batch_size} | mode={mode_label}")
                 logger.info(f"{'='*50}")
 
                 try:
                     if args.ipc:
-                        metrics = await run_ipc_mode(config, num_cards, num_instances, batch_size, ipc_manager)
+                        metrics = await run_ipc_benchmark(
+                            config, num_cards, num_instances, batch_size, ipc_manager
+                        )
                     else:
-                        metrics = await run_http_mode(config, num_cards, num_instances, batch_size, server_manager)
+                        metrics = await run_http_benchmark(
+                            config, num_cards, num_instances, batch_size, server_manager
+                        )
 
                     row = {
                         "mode": mode_label,
@@ -125,26 +150,26 @@ async def main():
                         "total_instances": total_instances,
                         "batch_size": batch_size,
                         "backend": config.backend,
-                        **metrics
+                        **metrics,
                     }
                     csv_writer.writerow(row)
                     csv_file.flush()
-                    logger.info(f"Result saved → {args.output_csv}")
+                    logger.info(f"Saved → {args.output_csv}  throughput={metrics.get('throughput_fps')} fps")
 
                 except Exception as e:
-                    logger.error(f"Benchmark run failed: {e}")
+                    logger.error(f"Benchmark run failed: {e}", exc_info=True)
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
     finally:
         if server_manager:
             server_manager.stop_all()
         if ipc_manager:
             ipc_manager.stop_all()
         csv_file.close()
-        logger.info("Benchmark finished. All workers stopped.")
+        logger.info("All workers stopped. Done.")
 
 
 if __name__ == "__main__":

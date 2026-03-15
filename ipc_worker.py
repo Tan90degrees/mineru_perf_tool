@@ -1,95 +1,87 @@
 """
 ipc_worker.py — Direct-call MinerU worker process.
 
-Each worker process:
-  1. Imports and warm-ups MinerU once (model loaded into NPU memory).
-  2. Loops on a multiprocessing.Queue receiving ParseRequest dicts.
-  3. Calls do_parse() directly — no HTTP, no socket, no network overhead.
-  4. Puts a ParseResponse dict onto the result queue when done.
+Connects to a MinerUQueueManager, pulls ParseRequest tasks from its
+private request queue, and processes them via do_parse() (or a mock
+sleep in --mock mode), then pushes results to the response queue.
 
-Usage (internal, launched by server_manager.py in "ipc" mode):
-    python ipc_worker.py --worker_id 0 --req_queue_file /tmp/req_0 ...
-
-Because multiprocessing.Queue cannot be pickled across process boundaries
-easily with spawn (Windows), we use a manager-based Queue passed through
-a shared file-descriptor or the Manager itself. However the cleanest cross-
-platform approach is to pass the Manager address via env-var and reconnect
-inside the worker.  We use multiprocessing.managers.BaseManager with an
-authkey so the worker can register and consume the same queues.
+Cross-platform notes:
+  - On Windows, this process is always started with spawn (not fork),
+    so all code here must be importable without side-effects at module level.
+  - The guard `if __name__ == '__main__': main()` is mandatory on Windows.
 """
 import os
 import sys
 import time
 import logging
 import argparse
-import multiprocessing
-import multiprocessing.managers
 import traceback
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger("ipc_worker")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] ipc_worker - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] ipc_worker - %(message)s",
+)
 
 
-# ---------------------------------------------------------------------------
-# Shared Manager definition (must be importable by both manager and workers)
-# ---------------------------------------------------------------------------
-class QueueManager(multiprocessing.managers.BaseManager):
-    pass
+def worker_loop(
+    worker_id: int,
+    manager_host: str,
+    manager_port: int,
+    authkey: bytes,
+    card_id: int,
+    backend: str,
+    parse_method: str,
+    lang: str,
+    output_dir: str,
+    mock: bool,
+):
+    """Main processing loop for one worker process."""
 
-
-def _get_req_queue():
-    """Placeholder — overridden by manager registration."""
-    raise NotImplementedError
-
-def _get_res_queue():
-    raise NotImplementedError
-
-
-QueueManager.register("get_req_queue", callable=_get_req_queue)
-QueueManager.register("get_res_queue", callable=_get_res_queue)
-
-
-# ---------------------------------------------------------------------------
-# Worker main loop
-# ---------------------------------------------------------------------------
-def worker_loop(worker_id: int, manager_address: tuple, authkey: bytes,
-                card_id: int, backend: str, parse_method: str,
-                lang: str, output_dir: str):
-    """
-    Connect to the QueueManager, pull tasks, call do_parse directly.
-    """
-    # Set NPU device visibility for this process
+    # Set NPU visibility before importing MinerU so it picks up the right card
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(card_id)
 
-    logger.info(f"[{worker_id}] Connecting to queue manager at {manager_address}")
-    manager = QueueManager(address=manager_address, authkey=authkey)
-    manager.connect()
+    # Connect to the shared queue manager
+    from ipc_queue_manager import connect_manager
+    logger.info(f"[{worker_id}] Connecting to queue manager at {manager_host}:{manager_port}")
+    manager = connect_manager(manager_host, manager_port, authkey)
 
-    req_queue = manager.get_req_queue()
-    res_queue = manager.get_res_queue()
+    req_queue = manager.get_req_queue(worker_id)
+    res_queue = manager.get_res_queue(worker_id)
+    logger.info(f"[{worker_id}] Queue connected. mock={mock}, card={card_id}, backend={backend}")
 
-    logger.info(f"[{worker_id}] Connected. Loading MinerU (backend={backend})...")
+    # Pre-load MinerU (real mode only)
+    if mock:
+        read_fn = None
+        do_parse = None
+        logger.info(f"[{worker_id}] Mock mode — skipping MinerU import.")
+    else:
+        try:
+            from mineru.cli.common import do_parse, read_fn
+            logger.info(f"[{worker_id}] MinerU loaded. Ready for tasks.")
+        except Exception as e:
+            logger.error(f"[{worker_id}] Failed to import MinerU: {e}")
+            res_queue.put({
+                "worker_id": worker_id,
+                "task_id": "startup",
+                "success_count": 0,
+                "error_count": 0,
+                "latency": 0.0,
+                "error": str(e),
+            })
+            return
 
-    # Pre-import to trigger model load once
-    try:
-        from mineru.cli.common import do_parse, read_fn
-        logger.info(f"[{worker_id}] MinerU imported successfully. Waiting for tasks...")
-    except Exception as e:
-        logger.error(f"[{worker_id}] Failed to import MinerU: {e}")
-        res_queue.put({"worker_id": worker_id, "task_id": "startup", "error": str(e)})
-        return
-
+    # Main task loop
     while True:
         try:
             task = req_queue.get(timeout=5)
         except Exception:
-            # Timeout or empty — check for poison pill later
-            continue
+            continue  # Timeout — keep waiting
 
         if task is None:
-            # Poison pill: shut down
-            logger.info(f"[{worker_id}] Received shutdown signal.")
+            logger.info(f"[{worker_id}] Shutdown signal received.")
             break
 
         task_id = task.get("task_id", "?")
@@ -101,52 +93,59 @@ def worker_loop(worker_id: int, manager_address: tuple, authkey: bytes,
         task_formula = task.get("formula_enable", True)
         task_table = task.get("table_enable", True)
 
-        logger.info(f"[{worker_id}] Task {task_id}: processing {len(file_paths)} files")
+        logger.info(f"[{worker_id}] Task {task_id[:8]}: {len(file_paths)} files")
         t0 = time.time()
 
         try:
-            pdf_file_names = []
-            pdf_bytes_list = []
-            for fp in file_paths:
-                pdf_bytes = read_fn(Path(fp))
-                pdf_bytes_list.append(pdf_bytes)
-                pdf_file_names.append(Path(fp).stem)
+            if mock:
+                # Simulate 0.5 s processing per batch (like the HTTP mock server)
+                time.sleep(0.5)
+                success_count = len(file_paths)
+                error_count = 0
+            else:
+                pdf_file_names = []
+                pdf_bytes_list = []
+                for fp in file_paths:
+                    pdf_bytes = read_fn(Path(fp))
+                    pdf_bytes_list.append(pdf_bytes)
+                    pdf_file_names.append(Path(fp).stem)
 
-            import uuid
-            unique_out = os.path.join(task_output_dir, str(uuid.uuid4()))
-            os.makedirs(unique_out, exist_ok=True)
+                unique_out = os.path.join(task_output_dir, str(uuid.uuid4()))
+                os.makedirs(unique_out, exist_ok=True)
 
-            do_parse(
-                output_dir=unique_out,
-                pdf_file_names=pdf_file_names,
-                pdf_bytes_list=pdf_bytes_list,
-                p_lang_list=[task_lang] * len(pdf_file_names),
-                backend=task_backend,
-                parse_method=task_parse_method,
-                formula_enable=task_formula,
-                table_enable=task_table,
-                f_draw_layout_bbox=False,
-                f_draw_span_bbox=False,
-                f_dump_md=True,
-                f_dump_middle_json=False,
-                f_dump_model_output=False,
-                f_dump_orig_pdf=False,
-                f_dump_content_list=False,
-            )
+                do_parse(
+                    output_dir=unique_out,
+                    pdf_file_names=pdf_file_names,
+                    pdf_bytes_list=pdf_bytes_list,
+                    p_lang_list=[task_lang] * len(pdf_file_names),
+                    backend=task_backend,
+                    parse_method=task_parse_method,
+                    formula_enable=task_formula,
+                    table_enable=task_table,
+                    f_draw_layout_bbox=False,
+                    f_draw_span_bbox=False,
+                    f_dump_md=True,
+                    f_dump_middle_json=False,
+                    f_dump_model_output=False,
+                    f_dump_orig_pdf=False,
+                    f_dump_content_list=False,
+                )
+                success_count = len(file_paths)
+                error_count = 0
 
             elapsed = time.time() - t0
-            logger.info(f"[{worker_id}] Task {task_id}: done in {elapsed:.2f}s")
+            logger.info(f"[{worker_id}] Task {task_id[:8]} done in {elapsed:.2f}s")
             res_queue.put({
                 "worker_id": worker_id,
                 "task_id": task_id,
-                "success_count": len(file_paths),
-                "error_count": 0,
+                "success_count": success_count,
+                "error_count": error_count,
                 "latency": elapsed,
             })
 
         except Exception as e:
             elapsed = time.time() - t0
-            logger.error(f"[{worker_id}] Task {task_id} failed: {e}\n{traceback.format_exc()}")
+            logger.error(f"[{worker_id}] Task {task_id[:8]} failed: {e}\n{traceback.format_exc()}")
             res_queue.put({
                 "worker_id": worker_id,
                 "task_id": task_id,
@@ -168,19 +167,23 @@ def main():
     parser.add_argument("--parse_method", type=str, default="auto")
     parser.add_argument("--lang", type=str, default="ch")
     parser.add_argument("--output_dir", type=str, default="./ipc_output")
+    parser.add_argument("--mock", action="store_true", help="Skip real MinerU, simulate processing")
     args = parser.parse_args()
 
     worker_loop(
         worker_id=args.worker_id,
-        manager_address=(args.manager_host, args.manager_port),
+        manager_host=args.manager_host,
+        manager_port=args.manager_port,
         authkey=args.authkey.encode(),
         card_id=args.card_id,
         backend=args.backend,
         parse_method=args.parse_method,
         lang=args.lang,
         output_dir=args.output_dir,
+        mock=args.mock,
     )
 
 
+# CRITICAL: Required on Windows to prevent recursive spawning
 if __name__ == "__main__":
     main()
